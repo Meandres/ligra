@@ -26,6 +26,7 @@
 #include <stdint.h>
 
 #include <gem5/m5ops.h>
+#include <m5_mmap.h>
 #include "api.hpp"
 #include "replacement.hpp"
 
@@ -200,6 +201,8 @@ int main(int argc, char **argv) {
 
     printf("[pagerank] taking checkpoint\n");
     fflush(stdout);
+    m5op_addr = 0xFFFF0000;
+    map_m5_mem();
     m5_checkpoint_addr(0, 0);
 
     // --- O3 measure (UPF, no OMP barriers while UIF=1) ---
