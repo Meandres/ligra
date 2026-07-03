@@ -3,14 +3,17 @@
 // Expects the ligra binary graph format (produced by adjToBinary):
 //   <prefix>.config  — text: n (vertex count)
 //   <prefix>.idx     — n uint32_t CSR offsets
-//   <prefix>.adj     — m uint32_t neighbor IDs  [ricochet-managed]
+//   <prefix>.adj     — m uint32_t neighbor IDs  [backend-managed]
 //
-// Flow:
+// Flow (ricochet backend):
 //   KVM:  run -warmup iterations (UFFD serves page faults), then checkpoint
 //   O3:   each OMP thread registers for UINTR, runs -measure iterations,
 //         then unregisters before any cross-thread synchronisation.
+// Flow (mmap backend): the .adj file is mmap'd and the kernel serves faults;
+//   warmup + checkpoint + measure run the same PageRank kernel with no UINTR.
 //
-// Usage: pagerank_ricochet <prefix> [-warmup N] [-measure M] [-threads T] [-phys MB]
+// Usage: pagerank_ricochet <prefix> [-backend ricochet|mmap]
+//                          [-warmup N] [-measure M] [-threads T] [-phys MB]
 
 #include <cassert>
 #include <cinttypes>
@@ -32,20 +35,10 @@
 
 static const double kDamping = 0.85;
 
-struct GraphCtx {
-    int   fd;
-    void *base;
-};
-
-static void graph_fill(void *buf, size_t offset, void *ctx) {
-    auto *g = static_cast<GraphCtx *>(ctx);
-    pread(g->fd, buf, 4096, static_cast<off_t>(offset));
-}
-
-static void graph_evict(size_t offset, void *ctx) {
-    auto *g = static_cast<GraphCtx *>(ctx);
-    madvise(static_cast<char *>(g->base) + offset, 4096, MADV_DONTNEED);
-}
+// Backend under test: our ricochet userspace page cache, or a plain kernel
+// mmap of the .adj file (the baseline we want to beat).  Same binary, chosen
+// at runtime with -backend, so both paths share the identical PageRank kernel.
+enum Backend { BK_RICOCHET, BK_MMAP };
 
 // Pull-based PageRank iteration (symmetric graphs: in-nbrs == out-nbrs).
 // adj[] is ricochet-managed; offsets, p_curr, p_next are in normal memory.
@@ -110,7 +103,8 @@ static double l1_norm(const double *a, const double *b, uint64_t n) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <prefix> [-warmup N] [-measure M] [-threads T] [-phys MB]\n",
+            "Usage: %s <prefix> [-backend ricochet|mmap] "
+            "[-warmup N] [-measure M] [-threads T] [-phys MB]\n",
             argv[0]);
         return 1;
     }
@@ -119,12 +113,19 @@ int main(int argc, char **argv) {
     int    measure_iters = 1;
     int    nthreads      = omp_get_max_threads();
     size_t phys_mb       = 0;
+    int    backend       = BK_RICOCHET;
 
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "-warmup")  && i + 1 < argc) warmup_iters  = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-measure") && i + 1 < argc) measure_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-threads") && i + 1 < argc) nthreads      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-phys")    && i + 1 < argc) phys_mb       = (size_t)atoll(argv[++i]);
+        else if (!strcmp(argv[i], "-backend") && i + 1 < argc) {
+            const char *b = argv[++i];
+            if      (!strcmp(b, "ricochet")) backend = BK_RICOCHET;
+            else if (!strcmp(b, "mmap"))     backend = BK_MMAP;
+            else { fprintf(stderr, "unknown backend '%s'\n", b); return 1; }
+        }
     }
 
     char cfg_path[4096], idx_path[4096], adj_path[4096];
@@ -161,28 +162,37 @@ int main(int argc, char **argv) {
     size_t adj_size = (size_t)adj_st.st_size;
     uint64_t m      = adj_size / sizeof(uint32_t);
 
-    printf("[pagerank] n=%" PRIu64 " m=%" PRIu64 " adj=%.1f MB phys=%zu MB threads=%d\n",
+    printf("[pagerank] backend=%s n=%" PRIu64 " m=%" PRIu64
+           " adj=%.1f MB phys=%zu MB threads=%d\n",
+           backend == BK_RICOCHET ? "ricochet" : "mmap",
            n, m, adj_size / 1e6, phys_mb, nthreads);
 
-    size_t page_size  = (size_t)sysconf(_SC_PAGESIZE);
-    size_t phys_pages = phys_mb ? (phys_mb * 1024 * 1024 / page_size) : 0;
-    ricochet::cache_init(phys_pages);
-    ricochet::handler_pool_init(nthreads);
-
-    GraphCtx gctx = {adj_fd, nullptr};
-    ricochet::Handlers handlers;
-    handlers.fill  = graph_fill;
-    handlers.evict = graph_evict;
-    handlers.ctx   = &gctx;
-
+    // adj[] is the backend-managed CSR neighbor array; offsets, p_curr, p_next
+    // stay in ordinary memory.
     ricochet::RicochetRegion adj_region{};
-    if (ricochet::region_init(&adj_region, adj_size, handlers, /*use_uffd=*/false) < 0) {
-        perror("region_init"); return 1;
-    }
-    gctx.base = adj_region.addr;
-    madvise(adj_region.addr, adj_region.size, MADV_NOHUGEPAGE);
+    const uint32_t *adj = nullptr;
 
-    const uint32_t *adj = (const uint32_t *)adj_region.addr;
+    if (backend == BK_RICOCHET) {
+        size_t page_size  = (size_t)sysconf(_SC_PAGESIZE);
+        size_t phys_pages = phys_mb ? (phys_mb * 1024 * 1024 / page_size) : 0;
+        ricochet::cache_init(phys_pages);
+        ricochet::handler_pool_init(nthreads);
+
+        // File-backed region: fills resolve with a single MADV_POPULATE_READ and
+        // eviction uses the batched MADV_DONTNEED default — no fill/evict handler.
+        ricochet::Handlers handlers;
+        if (ricochet::region_init(&adj_region, adj_size, handlers,
+                                  /*use_uffd=*/false, adj_fd) < 0) {
+            perror("region_init"); return 1;
+        }
+        madvise(adj_region.addr, adj_region.size, MADV_NOHUGEPAGE);
+        adj = (const uint32_t *)adj_region.addr;
+    } else {
+        void *a = mmap(nullptr, adj_size, PROT_READ, MAP_PRIVATE, adj_fd, 0);
+        if (a == MAP_FAILED) { perror("mmap adj"); return 1; }
+        madvise(a, adj_size, MADV_NOHUGEPAGE);
+        adj = (const uint32_t *)a;
+    }
 
     double *p_curr = (double *)malloc(n * sizeof(double));
     double *p_next = (double *)malloc(n * sizeof(double));
@@ -205,26 +215,35 @@ int main(int argc, char **argv) {
     map_m5_mem();
     m5_checkpoint_addr(0, 0);
 
-    // --- O3 measure (UPF, no OMP barriers while UIF=1) ---
-    ricochet::stop_handler_pool();
+    // --- O3 measure ---
+    if (backend == BK_RICOCHET)
+        ricochet::stop_handler_pool();
 
     for (int it = 0; it < measure_iters; it++) {
-        uint64_t faults_before = ricochet::global_cache().evictedPageCount.load();
+        uint64_t faults_before =
+            backend == BK_RICOCHET ? ricochet::global_cache().evictedPageCount.load() : 0;
 
-        // Each thread registers for UINTR, does its work, then unregisters.
-        // The barrier before enable_uintr is the last OMP barrier during UIF=1.
-        #pragma omp parallel num_threads(nthreads)
-        {
-            ricochet::region_register_thread();
-            #pragma omp barrier              // all registered before any enables
-            ricochet::region_enable_uintr(); // UIF=1 — no more barriers after this
+        if (backend == BK_RICOCHET) {
+            // Each thread registers for UINTR, does its work, then unregisters.
+            // The barrier before enable_uintr is the last OMP barrier during UIF=1.
+            #pragma omp parallel num_threads(nthreads)
+            {
+                ricochet::region_register_thread();
+                #pragma omp barrier              // all registered before any enables
+                ricochet::region_enable_uintr(); // UIF=1 — no more barriers after this
 
-            pagerank_iter_upf(adj, offsets, n, m, p_curr, p_next);
+                pagerank_iter_upf(adj, offsets, n, m, p_curr, p_next);
 
-            ricochet::region_unregister_thread(); // UIF=0 before parallel-section exit barrier
+                ricochet::region_unregister_thread(); // UIF=0 before parallel-section exit barrier
+            }
+        } else {
+            // mmap backend: the kernel serves faults; OMP barriers are safe.
+            pagerank_iter_parallel(adj, offsets, n, m, p_curr, p_next, nthreads);
         }
 
-        uint64_t faults = ricochet::global_cache().evictedPageCount.load() - faults_before;
+        uint64_t faults =
+            backend == BK_RICOCHET
+                ? ricochet::global_cache().evictedPageCount.load() - faults_before : 0;
         double l1 = l1_norm(p_curr, p_next, n);
         printf("[pagerank] measure %d  L1=%.6f  faults=%" PRIu64 "\n", it, l1, faults);
 
@@ -232,7 +251,10 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < n; i++) p_next[i] = 0.0;
     }
 
-    ricochet::region_destroy(&adj_region);
+    if (backend == BK_RICOCHET)
+        ricochet::region_destroy(&adj_region);
+    else
+        munmap((void *)adj, adj_size);
     free(p_curr); free(p_next); free(offsets);
     close(adj_fd);
     return 0;
