@@ -40,6 +40,55 @@ static const double kDamping = 0.85;
 // at runtime with -backend, so both paths share the identical PageRank kernel.
 enum Backend { BK_RICOCHET, BK_MMAP };
 
+// Replacement policy for the ricochet backend:
+//   default  — ricochet's built-in S3-FIFO cache (oblivious; thrashes on a
+//              looping sequential scan larger than the cache).
+//   pin      — app-managed scan-resistant policy: each worker pins the first
+//              pages of its contiguous adj[] slice (kept resident across
+//              iterations) and evict-behind for the rest.  ricochet only fills;
+//              the app owns eviction (see api.hpp region_set_app_managed).
+enum Policy { POL_DEFAULT, POL_PIN };
+
+// --- app-managed scan-resistant policy (per-thread, lock-free) ---
+// PageRank workers stream disjoint contiguous slices of adj[], so each thread's
+// residency is independent — no cross-thread synchronization needed.
+static thread_local uint64_t tl_pin_end_pg     = 0;      // pages < this are pinned
+static thread_local uint64_t tl_prev_stream_pg = ~0ULL;  // last non-pinned page
+static thread_local size_t   tl_evict_buf[64];
+static thread_local int      tl_evict_n = 0;
+
+// Called by ricochet after it fills a faulted page.  Pinned pages stay; for a
+// streaming page we drop the previous one (the sequential scan is done with it).
+static void pin_on_fault(ricochet::RicochetRegion *r, size_t offset, void *) {
+    uint64_t pg = offset >> 12;
+    if (pg < tl_pin_end_pg) return;                        // pinned: keep resident
+    if (tl_prev_stream_pg != ~0ULL) {
+        tl_evict_buf[tl_evict_n++] = (size_t)(tl_prev_stream_pg << 12);
+        if (tl_evict_n == 64) {
+            ricochet::do_evict_pages(r, tl_evict_buf, tl_evict_n);
+            tl_evict_n = 0;
+        }
+    }
+    tl_prev_stream_pg = pg;
+}
+
+static void pin_flush(ricochet::RicochetRegion *r) {
+    if (tl_evict_n) { ricochet::do_evict_pages(r, tl_evict_buf, tl_evict_n); tl_evict_n = 0; }
+    tl_prev_stream_pg = ~0ULL;
+}
+
+// Drop every PTE in the region so the app-managed measured phase starts from an
+// empty residency and every first access faults through the policy hook.
+static void cold_evict_region(ricochet::RicochetRegion *r) {
+    size_t npages = r->size / 4096;
+    size_t buf[512];
+    for (size_t base = 0; base < npages; ) {
+        int k = 0;
+        while (k < 512 && base < npages) buf[k++] = (base++) * 4096;
+        ricochet::do_evict_pages(r, buf, k);
+    }
+}
+
 // Pull-based PageRank iteration (symmetric graphs: in-nbrs == out-nbrs).
 // adj[] is ricochet-managed; offsets, p_curr, p_next are in normal memory.
 // Safe to call with OMP barriers (use_uffd mode or UIF=0).
@@ -103,7 +152,7 @@ static double l1_norm(const double *a, const double *b, uint64_t n) {
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <prefix> [-backend ricochet|mmap] "
+            "Usage: %s <prefix> [-backend ricochet|mmap] [-policy default|pin] "
             "[-warmup N] [-measure M] [-threads T] [-phys MB]\n",
             argv[0]);
         return 1;
@@ -114,6 +163,7 @@ int main(int argc, char **argv) {
     int    nthreads      = omp_get_max_threads();
     size_t phys_mb       = 0;
     int    backend       = BK_RICOCHET;
+    int    policy        = POL_DEFAULT;
 
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "-warmup")  && i + 1 < argc) warmup_iters  = atoi(argv[++i]);
@@ -126,7 +176,15 @@ int main(int argc, char **argv) {
             else if (!strcmp(b, "mmap"))     backend = BK_MMAP;
             else { fprintf(stderr, "unknown backend '%s'\n", b); return 1; }
         }
+        else if (!strcmp(argv[i], "-policy") && i + 1 < argc) {
+            const char *p = argv[++i];
+            if      (!strcmp(p, "default")) policy = POL_DEFAULT;
+            else if (!strcmp(p, "pin"))     policy = POL_PIN;
+            else { fprintf(stderr, "unknown policy '%s'\n", p); return 1; }
+        }
     }
+    // The pin policy is app-managed residency, only meaningful for ricochet.
+    if (backend != BK_RICOCHET) policy = POL_DEFAULT;
 
     char cfg_path[4096], idx_path[4096], adj_path[4096];
     snprintf(cfg_path, sizeof(cfg_path), "%s.config", prefix);
@@ -162,19 +220,21 @@ int main(int argc, char **argv) {
     size_t adj_size = (size_t)adj_st.st_size;
     uint64_t m      = adj_size / sizeof(uint32_t);
 
-    printf("[pagerank] backend=%s n=%" PRIu64 " m=%" PRIu64
+    printf("[pagerank] backend=%s policy=%s n=%" PRIu64 " m=%" PRIu64
            " adj=%.1f MB phys=%zu MB threads=%d\n",
            backend == BK_RICOCHET ? "ricochet" : "mmap",
+           policy == POL_PIN ? "pin" : "default",
            n, m, adj_size / 1e6, phys_mb, nthreads);
 
     // adj[] is the backend-managed CSR neighbor array; offsets, p_curr, p_next
     // stay in ordinary memory.
     ricochet::RicochetRegion adj_region{};
     const uint32_t *adj = nullptr;
+    size_t phys_pages = 0;  // ricochet cache size in pages (0 = unlimited)
 
     if (backend == BK_RICOCHET) {
         size_t page_size  = (size_t)sysconf(_SC_PAGESIZE);
-        size_t phys_pages = phys_mb ? (phys_mb * 1024 * 1024 / page_size) : 0;
+        phys_pages = phys_mb ? (phys_mb * 1024 * 1024 / page_size) : 0;
         ricochet::cache_init(phys_pages);
         ricochet::handler_pool_init(nthreads);
 
@@ -219,9 +279,24 @@ int main(int argc, char **argv) {
     if (backend == BK_RICOCHET)
         ricochet::stop_handler_pool();
 
+    // Switch the region to app-managed residency for the pin policy: cold-evict
+    // it (so the measured phase starts empty and every access faults through the
+    // policy) and install the on_fault hook.  Per-thread pin budget below.
+    uint64_t pin_pages_per_thread = 0;
+    if (policy == POL_PIN) {
+        cold_evict_region(&adj_region);
+        adj_region.handlers.on_fault = pin_on_fault;
+        ricochet::region_set_app_managed(&adj_region, true);
+        uint64_t per_thread = phys_pages / (uint64_t)nthreads;
+        // Reserve one evict batch (64) + current page for streaming headroom.
+        pin_pages_per_thread = per_thread > 128 ? per_thread - 65 : per_thread / 2;
+        printf("[pagerank] policy=pin: pinning up to %" PRIu64 " pages/thread\n",
+               pin_pages_per_thread);
+    }
+
     for (int it = 0; it < measure_iters; it++) {
         uint64_t faults_before =
-            backend == BK_RICOCHET ? ricochet::global_cache().evictedPageCount.load() : 0;
+            backend == BK_RICOCHET ? ricochet::global_cache().upfFaultCount.load() : 0;
 
         if (backend == BK_RICOCHET) {
             // Each thread registers for UINTR, does its work, then unregisters.
@@ -229,12 +304,30 @@ int main(int argc, char **argv) {
             #pragma omp parallel num_threads(nthreads)
             {
                 ricochet::region_register_thread();
+
+                // Per-thread pin window over this worker's contiguous adj slice.
+                if (policy == POL_PIN) {
+                    int tid = omp_get_thread_num();
+                    uint64_t v0 = (uint64_t)tid * n / (uint64_t)nthreads;
+                    uint64_t v1 = (uint64_t)(tid + 1) * n / (uint64_t)nthreads;
+                    uint64_t first_pg = ((uint64_t)offsets[v0] * sizeof(uint32_t)) >> 12;
+                    uint64_t last_byte = (uint64_t)(v1 < n ? offsets[v1] : (uint32_t)m)
+                                         * sizeof(uint32_t);
+                    uint64_t slice_pages = ((last_byte + 4095) >> 12) - first_pg;
+                    uint64_t pin = pin_pages_per_thread < slice_pages
+                                       ? pin_pages_per_thread : slice_pages;
+                    tl_pin_end_pg     = first_pg + pin;
+                    tl_prev_stream_pg = ~0ULL;
+                    tl_evict_n        = 0;
+                }
+
                 #pragma omp barrier              // all registered before any enables
                 ricochet::region_enable_uintr(); // UIF=1 — no more barriers after this
 
                 pagerank_iter_upf(adj, offsets, n, m, p_curr, p_next);
 
                 ricochet::region_unregister_thread(); // UIF=0 before parallel-section exit barrier
+                if (policy == POL_PIN) pin_flush(&adj_region);
             }
         } else {
             // mmap backend: the kernel serves faults; OMP barriers are safe.
@@ -243,7 +336,7 @@ int main(int argc, char **argv) {
 
         uint64_t faults =
             backend == BK_RICOCHET
-                ? ricochet::global_cache().evictedPageCount.load() - faults_before : 0;
+                ? ricochet::global_cache().upfFaultCount.load() - faults_before : 0;
         double l1 = l1_norm(p_curr, p_next, n);
         printf("[pagerank] measure %d  L1=%.6f  faults=%" PRIu64 "\n", it, l1, faults);
 
