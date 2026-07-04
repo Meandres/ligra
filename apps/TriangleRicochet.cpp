@@ -17,8 +17,13 @@
 //             cache budget (that's where the reuse is); the rest run through a
 //             small per-thread FIFO.  ricochet only fills; the app evicts.
 //
+// Single O3 run: a warmup window of Wu source vertices (untimed) fills residency
+// via UPF, then a window of W source vertices is timed with rdtsc.  Throughput is
+// reported as edges/kcycle (degree-skew-normalised), not vertices — in RMAT a
+// "vertex" is a wildly uneven unit of work.
+//
 // Usage: triangle_ricochet <prefix> [-backend ricochet|mmap]
-//        [-policy default|degree] [-verts W] [-warmup N] [-measure M]
+//        [-policy default|degree] [-verts W] [-warmup Wu] [-measure M]
 //        [-threads T] [-phys MB]
 
 #include <algorithm>
@@ -106,6 +111,20 @@ static inline void progress(int tid, uint64_t done, uint64_t total) {
     (void)!write(1, b, l);
 }
 
+// Heartbeat stride (source vertices) in the measured window — kept small so
+// progress is visible under very slow O3; override with TR_HB=<n>.
+static uint64_t hb_step() {
+    const char *e = getenv("TR_HB");
+    uint64_t s = e ? strtoull(e, nullptr, 10) : 10;
+    return s ? s : 1;
+}
+
+static inline uint64_t rdtsc() {
+    unsigned lo, hi;
+    __asm__ __volatile__("lfence; rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 // Count common neighbors w > v of two sorted adjacency lists (triangle u<v<w).
 static inline uint64_t intersect_gt(const uint32_t *au, uint32_t du,
                                     const uint32_t *av, uint32_t dv, uint32_t v) {
@@ -145,35 +164,60 @@ static uint64_t triangle_range(const uint32_t *adj, const uint32_t *offsets,
     return tri;
 }
 
-// OMP-parallel version for KVM warmup (barriers safe, no UINTR).
-static uint64_t triangle_parallel(const uint32_t *adj, const uint32_t *offsets,
-                                  uint64_t n, uint64_t m, uint64_t W, int T) {
-    uint64_t total = 0;
-    #pragma omp parallel for num_threads(T) schedule(dynamic, 32) reduction(+:total)
-    for (uint64_t u = 0; u < W; u++)
-        total += triangle_range(adj, offsets, n, m, u, u + 1);
-    return total;
+// Process the source-vertex window [s, e) once across nthreads.  For the
+// ricochet backend each worker registers + enables UINTR so faults are handled
+// through the app-managed residency path (as in the measured region); the join
+// at the end of the parallel region happens with UIF=0 (region_unregister_thread
+// clears it), so it is safe to time or barrier around this call.  When verbose,
+// each worker emits heartbeats over its slice.
+static uint64_t run_window(bool ricochet, int policy, ricochet::RicochetRegion *rr,
+                           const uint32_t *adj, const uint32_t *offsets,
+                           uint64_t n, uint64_t m, uint64_t s, uint64_t e,
+                           int nthreads, bool verbose) {
+    uint64_t parts[MAXT] = {0};
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int tid = omp_get_thread_num();
+        if (ricochet) {
+            ricochet::region_register_thread();
+            if (policy == POL_DEGREE) { tl_ring_init = false; tl_ring_pos = 0; tl_evict_n = 0; }
+            #pragma omp barrier
+            ricochet::region_enable_uintr();
+        }
+        uint64_t span = e - s;
+        uint64_t ws = s + (uint64_t)tid * span / (uint64_t)nthreads;
+        uint64_t we = s + (uint64_t)(tid + 1) * span / (uint64_t)nthreads;
+        parts[tid] = triangle_range(adj, offsets, n, m, ws, we,
+                                    verbose ? tid : -1, verbose ? hb_step() : 0);
+        if (ricochet) {
+            ricochet::region_unregister_thread();
+            if (policy == POL_DEGREE) degree_flush(rr);
+        }
+    }
+    uint64_t tri = 0;
+    for (int t = 0; t < nthreads; t++) tri += parts[t];
+    return tri;
 }
 
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
             "Usage: %s <prefix> [-backend ricochet|mmap] [-policy default|degree] "
-            "[-verts W] [-warmup N] [-measure M] [-threads T] [-phys MB]\n",
+            "[-verts W] [-warmup Wu] [-measure M] [-threads T] [-phys MB]\n",
             argv[0]);
         return 1;
     }
     const char *prefix = argv[1];
-    int    warmup_iters  = 1;
-    int    measure_iters = 1;
+    uint64_t warmup_verts  = 4096;   // source vertices warmed (untimed) to fill residency
+    int    measure_iters = 1;        // timed windows (variance samples)
     int    nthreads      = omp_get_max_threads();
     size_t phys_mb       = 0;
     int    backend       = BK_RICOCHET;
     int    policy        = POL_DEFAULT;
-    uint64_t verts       = 2048;   // source vertices processed per measured run
+    uint64_t verts       = 2048;   // source vertices in the timed window
 
     for (int i = 2; i < argc; i++) {
-        if      (!strcmp(argv[i], "-warmup")  && i + 1 < argc) warmup_iters  = atoi(argv[++i]);
+        if      (!strcmp(argv[i], "-warmup")  && i + 1 < argc) warmup_verts  = (uint64_t)atoll(argv[++i]);
         else if (!strcmp(argv[i], "-measure") && i + 1 < argc) measure_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-threads") && i + 1 < argc) nthreads      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-phys")    && i + 1 < argc) phys_mb       = (size_t)atoll(argv[++i]);
@@ -230,10 +274,10 @@ int main(int argc, char **argv) {
     uint64_t m      = adj_size / sizeof(uint32_t);
 
     printf("[triangle] backend=%s policy=%s n=%" PRIu64 " m=%" PRIu64
-           " adj=%.1f MB phys=%zu MB threads=%d verts=%" PRIu64 "\n",
+           " adj=%.1f MB phys=%zu MB threads=%d warmup=%" PRIu64 " verts=%" PRIu64 "\n",
            backend == BK_RICOCHET ? "ricochet" : "mmap",
            policy == POL_DEGREE ? "degree" : "default",
-           n, m, adj_size / 1e6, phys_mb, nthreads, verts);
+           n, m, adj_size / 1e6, phys_mb, nthreads, warmup_verts, verts);
 
     ricochet::RicochetRegion adj_region{};
     const uint32_t *adj = nullptr;
@@ -258,28 +302,14 @@ int main(int argc, char **argv) {
         adj = (const uint32_t *)a;
     }
 
-    // --- KVM warmup (UFFD, OMP barriers safe) ---
-    printf("[triangle] warmup: %d iter(s)\n", warmup_iters);
-    for (int it = 0; it < warmup_iters; it++) {
-        uint64_t t = triangle_parallel(adj, offsets, n, m, verts, nthreads);
-        printf("[triangle] warmup %d  triangles=%" PRIu64 "\n", it, t);
-    }
-
-    printf("[triangle] taking checkpoint\n");
-    fflush(stdout);
-    m5op_addr = 0xFFFF0000;
-    map_m5_mem();
-    m5_checkpoint_addr(0, 0);
-
-    // --- O3 measure ---
-    if (backend == BK_RICOCHET)
-        ricochet::stop_handler_pool();
-
+    // --- Policy setup + cold start, BEFORE the checkpoint (in KVM) ---
+    // The pin set + app-managed residency must be in place before the timed run,
+    // and the region must start cold so the O3 warmup window is what fills it via
+    // UPF (the previous split — warm in KVM, then cold_evict after checkpoint —
+    // left the measured window paying every fill fault).
     if (policy == POL_DEGREE) {
-        // Build the degree-ordered pin set: pin the adjacency pages of the
-        // highest-degree vertices up to the cache budget (leave nthreads*RING
-        // pages of streaming headroom for the per-thread FIFOs).
-        cold_evict_region(&adj_region);
+        // Pin the adjacency pages of the highest-degree vertices up to the cache
+        // budget (leave nthreads*RING pages of streaming headroom for the FIFOs).
         std::vector<uint32_t> order(n);
         for (uint64_t i = 0; i < n; i++) order[i] = (uint32_t)i;
         auto deg = [&](uint32_t v) {
@@ -316,39 +346,55 @@ int main(int argc, char **argv) {
                pinned, total_pages);
     }
 
+    // Cold start: drop residency so the O3 warmup window fills the cache.
+    if (backend == BK_RICOCHET) {
+        cold_evict_region(&adj_region);
+        ricochet::stop_handler_pool();
+    } else {
+        madvise((void *)adj, adj_size, MADV_DONTNEED);
+    }
+
+    // Window layout: warm [0, warm_end), then time [meas_beg, meas_end).
+    uint64_t warm_end = warmup_verts < n ? warmup_verts : n;
+    uint64_t meas_beg = warm_end;
+    uint64_t meas_end = meas_beg + verts;
+    if (meas_end > n) meas_end = n;
+    printf("[triangle] warmup [0,%" PRIu64 ")  measure [%" PRIu64 ",%" PRIu64 ")\n",
+           warm_end, meas_beg, meas_end);
+    fflush(stdout);
+
+    printf("[triangle] taking checkpoint\n");
+    fflush(stdout);
+    m5op_addr = 0xFFFF0000;
+    map_m5_mem();
+    m5_checkpoint_addr(0, 0);
+
+    // --- O3: single run — warmup window (untimed), then timed measured window(s) ---
+    bool ric = (backend == BK_RICOCHET);
+    run_window(ric, policy, &adj_region, adj, offsets, n, m,
+               0, warm_end, nthreads, /*verbose=*/false);
+
+    // Edges in the measured window (CSR — no adj read); the throughput basis.
+    uint64_t win_edges = 0;
+    if (meas_beg < n && meas_end > meas_beg) {
+        uint64_t e_beg = offsets[meas_beg];
+        uint64_t e_end = (meas_end < n) ? offsets[meas_end] : m;
+        win_edges = e_end - e_beg;
+    }
+
     for (int it = 0; it < measure_iters; it++) {
-        uint64_t faults_before =
-            backend == BK_RICOCHET ? ricochet::global_cache().upfFaultCount.load() : 0;
-        uint64_t tri = 0;
-
-        if (backend == BK_RICOCHET) {
-            uint64_t parts[MAXT] = {0};
-            #pragma omp parallel num_threads(nthreads)
-            {
-                ricochet::region_register_thread();
-                if (policy == POL_DEGREE) { tl_ring_init = false; tl_ring_pos = 0; tl_evict_n = 0; }
-                #pragma omp barrier
-                ricochet::region_enable_uintr();
-
-                int tid = omp_get_thread_num();
-                uint64_t s = (uint64_t)tid * verts / (uint64_t)nthreads;
-                uint64_t e = (uint64_t)(tid + 1) * verts / (uint64_t)nthreads;
-                uint64_t step = (e - s) / 20 ? (e - s) / 20 : 1;
-                parts[tid] = triangle_range(adj, offsets, n, m, s, e, tid, step);
-
-                ricochet::region_unregister_thread();
-                if (policy == POL_DEGREE) degree_flush(&adj_region);
-            }
-            for (int t = 0; t < nthreads; t++) tri += parts[t];
-        } else {
-            tri = triangle_parallel(adj, offsets, n, m, verts, nthreads);
-        }
-
-        uint64_t faults =
-            backend == BK_RICOCHET
-                ? ricochet::global_cache().upfFaultCount.load() - faults_before : 0;
-        printf("[triangle] measure %d  triangles=%" PRIu64 "  faults=%" PRIu64 "\n",
-               it, tri, faults);
+        uint64_t faults_before = ric ? ricochet::global_cache().upfFaultCount.load() : 0;
+        uint64_t c0 = rdtsc();
+        uint64_t tri = run_window(ric, policy, &adj_region, adj, offsets, n, m,
+                                  meas_beg, meas_end, nthreads, /*verbose=*/true);
+        uint64_t c1 = rdtsc();
+        uint64_t faults = ric ? ricochet::global_cache().upfFaultCount.load() - faults_before : 0;
+        uint64_t cyc = c1 - c0;
+        double eppk = cyc ? (double)win_edges / (double)cyc * 1000.0 : 0.0;
+        printf("[triangle] measure %d  triangles=%" PRIu64 "  edges=%" PRIu64
+               "  faults=%" PRIu64 "  cycles=%" PRIu64 "  edges_per_kcycle=%.3f\n",
+               it, tri, win_edges, faults, cyc, eppk);
+        fflush(stdout);
     }
 
     if (backend == BK_RICOCHET)
