@@ -101,26 +101,37 @@ static void cold_evict_region(ricochet::RicochetRegion *r) {
 
 // Pull-based PageRank iteration (symmetric graphs: in-nbrs == out-nbrs).
 // adj[] is ricochet-managed; offsets, p_curr, p_next are in normal memory.
-// Safe to call with OMP barriers (use_uffd mode or UIF=0).
+// Safe to call with OMP barriers (use_uffd mode or UIF=0).  Manual contiguous
+// split (== schedule(static)) so each worker can emit heartbeats when verbose;
+// warmup calls it quiet, the mmap measured phase calls it verbose.
 static void pagerank_iter_parallel(const uint32_t *adj, const uint32_t *offsets,
                                    uint64_t n, uint64_t m,
                                    const double *p_curr, double *p_next,
-                                   int nthreads) {
+                                   int nthreads, bool verbose = false) {
     double add_const = (1.0 - kDamping) / (double)n;
-    #pragma omp parallel for num_threads(nthreads) schedule(static)
-    for (uint64_t v = 0; v < n; v++) {
-        uint32_t start = offsets[v];
-        uint32_t end   = (v + 1 < n) ? offsets[v + 1] : (uint32_t)m;
-        double sum = 0.0;
-        for (uint32_t j = start; j < end; j++) {
-            uint32_t u     = adj[j];
-            uint32_t u_s   = offsets[u];
-            uint32_t u_e   = (u + 1 < n) ? offsets[u + 1] : (uint32_t)m;
-            uint32_t u_deg = u_e - u_s;
-            if (u_deg > 0)
-                sum += p_curr[u] / (double)u_deg;
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int tid = omp_get_thread_num();
+        uint64_t my_start = (uint64_t)tid * n / (uint64_t)nthreads;
+        uint64_t my_end   = (uint64_t)(tid + 1) * n / (uint64_t)nthreads;
+        uint64_t span = my_end - my_start;
+        uint64_t step = span / 20 ? span / 20 : 1;
+
+        for (uint64_t v = my_start; v < my_end; v++) {
+            if (verbose && (v - my_start) % step == 0) progress(tid, v - my_start, span);
+            uint32_t start = offsets[v];
+            uint32_t end   = (v + 1 < n) ? offsets[v + 1] : (uint32_t)m;
+            double sum = 0.0;
+            for (uint32_t j = start; j < end; j++) {
+                uint32_t u     = adj[j];
+                uint32_t u_s   = offsets[u];
+                uint32_t u_e   = (u + 1 < n) ? offsets[u + 1] : (uint32_t)m;
+                uint32_t u_deg = u_e - u_s;
+                if (u_deg > 0)
+                    sum += p_curr[u] / (double)u_deg;
+            }
+            p_next[v] = kDamping * sum + add_const;
         }
-        p_next[v] = kDamping * sum + add_const;
     }
 }
 
@@ -345,7 +356,8 @@ int main(int argc, char **argv) {
             }
         } else {
             // mmap backend: the kernel serves faults; OMP barriers are safe.
-            pagerank_iter_parallel(adj, offsets, n, m, p_curr, p_next, nthreads);
+            pagerank_iter_parallel(adj, offsets, n, m, p_curr, p_next, nthreads,
+                                   /*verbose=*/true);
         }
 
         uint64_t faults =
