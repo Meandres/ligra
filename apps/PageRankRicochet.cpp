@@ -45,6 +45,15 @@ static inline void progress(int tid, uint64_t done, uint64_t total) {
     (void)!write(1, b, l);
 }
 
+// Heartbeat interval (in vertices) — how often progress() fires in the measured
+// loops.  Kept tiny so progress is visible early under very slow O3; override
+// with PR_HB=<n> to trade log volume for granularity without a rebuild.
+static uint64_t hb_step() {
+    const char *e = getenv("PR_HB");
+    uint64_t s = e ? strtoull(e, nullptr, 10) : 10;
+    return s ? s : 1;
+}
+
 // Backend under test: our ricochet userspace page cache, or a plain kernel
 // mmap of the .adj file (the baseline we want to beat).  Same binary, chosen
 // at runtime with -backend, so both paths share the identical PageRank kernel.
@@ -115,7 +124,7 @@ static void pagerank_iter_parallel(const uint32_t *adj, const uint32_t *offsets,
         uint64_t my_start = (uint64_t)tid * n / (uint64_t)nthreads;
         uint64_t my_end   = (uint64_t)(tid + 1) * n / (uint64_t)nthreads;
         uint64_t span = my_end - my_start;
-        uint64_t step = span / 20 ? span / 20 : 1;
+        uint64_t step = hb_step();
 
         for (uint64_t v = my_start; v < my_end; v++) {
             if (verbose && (v - my_start) % step == 0) progress(tid, v - my_start, span);
@@ -149,7 +158,7 @@ static void pagerank_iter_upf(const uint32_t *adj, const uint32_t *offsets,
     double add_const  = (1.0 - kDamping) / (double)n;
 
     uint64_t span = my_end - my_start;
-    uint64_t step = span / 20 ? span / 20 : 1;   // ~20 heartbeats per thread
+    uint64_t step = hb_step();
 
     for (uint64_t v = my_start; v < my_end; v++) {
         if ((v - my_start) % step == 0) progress(tid, v - my_start, span);
