@@ -35,6 +35,16 @@
 
 static const double kDamping = 0.85;
 
+// Heartbeat print usable inside the UIF=1 measured region: a single write()
+// syscall (no stdio locks that a UINTR could interrupt mid-hold), one short
+// line so concurrent per-thread writes don't tear.
+static inline void progress(int tid, uint64_t done, uint64_t total) {
+    char b[80];
+    int l = snprintf(b, sizeof b, "[pagerank]   t%d %llu/%llu\n", tid,
+                     (unsigned long long)done, (unsigned long long)total);
+    (void)!write(1, b, l);
+}
+
 // Backend under test: our ricochet userspace page cache, or a plain kernel
 // mmap of the .adj file (the baseline we want to beat).  Same binary, chosen
 // at runtime with -backend, so both paths share the identical PageRank kernel.
@@ -127,7 +137,11 @@ static void pagerank_iter_upf(const uint32_t *adj, const uint32_t *offsets,
     uint64_t my_end   = (uint64_t)(tid + 1) * n / (uint64_t)nthreads;
     double add_const  = (1.0 - kDamping) / (double)n;
 
+    uint64_t span = my_end - my_start;
+    uint64_t step = span / 20 ? span / 20 : 1;   // ~20 heartbeats per thread
+
     for (uint64_t v = my_start; v < my_end; v++) {
+        if ((v - my_start) % step == 0) progress(tid, v - my_start, span);
         uint32_t start = offsets[v];
         uint32_t end   = (v + 1 < n) ? offsets[v + 1] : (uint32_t)m;
         double sum = 0.0;

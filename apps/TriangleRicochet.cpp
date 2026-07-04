@@ -97,6 +97,15 @@ static void cold_evict_region(ricochet::RicochetRegion *r) {
     }
 }
 
+// Heartbeat print usable inside the UIF=1 measured region (single write(),
+// no stdio locks, short line so concurrent per-thread writes don't tear).
+static inline void progress(int tid, uint64_t done, uint64_t total) {
+    char b[80];
+    int l = snprintf(b, sizeof b, "[triangle]   t%d %llu/%llu\n", tid,
+                     (unsigned long long)done, (unsigned long long)total);
+    (void)!write(1, b, l);
+}
+
 // Count common neighbors w > v of two sorted adjacency lists (triangle u<v<w).
 static inline uint64_t intersect_gt(const uint32_t *au, uint32_t du,
                                     const uint32_t *av, uint32_t dv, uint32_t v) {
@@ -115,9 +124,12 @@ static inline uint64_t intersect_gt(const uint32_t *au, uint32_t du,
 // Process source vertices [s, e): for each edge (u,v) with v>u, count common
 // neighbors.  adj[] is ricochet-managed; offsets is in ordinary memory.
 static uint64_t triangle_range(const uint32_t *adj, const uint32_t *offsets,
-                               uint64_t n, uint64_t m, uint64_t s, uint64_t e) {
+                               uint64_t n, uint64_t m, uint64_t s, uint64_t e,
+                               int tid = -1, uint64_t prog_step = 0) {
     uint64_t tri = 0;
     for (uint64_t u = s; u < e; u++) {
+        if (prog_step && tid >= 0 && (u - s) % prog_step == 0)
+            progress(tid, u - s, e - s);
         uint32_t us = offsets[u];
         uint32_t ue = (u + 1 < n) ? offsets[u + 1] : (uint32_t)m;
         const uint32_t *au = adj + us;
@@ -321,7 +333,8 @@ int main(int argc, char **argv) {
                 int tid = omp_get_thread_num();
                 uint64_t s = (uint64_t)tid * verts / (uint64_t)nthreads;
                 uint64_t e = (uint64_t)(tid + 1) * verts / (uint64_t)nthreads;
-                parts[tid] = triangle_range(adj, offsets, n, m, s, e);
+                uint64_t step = (e - s) / 20 ? (e - s) / 20 : 1;
+                parts[tid] = triangle_range(adj, offsets, n, m, s, e, tid, step);
 
                 ricochet::region_unregister_thread();
                 if (policy == POL_DEGREE) degree_flush(&adj_region);
