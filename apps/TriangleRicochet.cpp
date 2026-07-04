@@ -17,13 +17,14 @@
 //             cache budget (that's where the reuse is); the rest run through a
 //             small per-thread FIFO.  ricochet only fills; the app evicts.
 //
-// Single O3 run: a warmup window of Wu source vertices (untimed) fills residency
-// via UPF, then a window of W source vertices is timed with rdtsc.  Throughput is
-// reported as edges/kcycle (degree-skew-normalised), not vertices — in RMAT a
-// "vertex" is a wildly uneven unit of work.
+// Warmup runs in KVM (fast) to establish residency, then the checkpoint switches
+// to O3 and only a small window of W source vertices is timed with rdtsc.  The
+// windows start at -voff (default n/2) so no source vertex is a mega-hub — in
+// RMAT a low-ID vertex has huge degree and processing it as a source scans most
+// of the graph.  Throughput is reported as edges/kcycle (degree-skew-normalised).
 //
 // Usage: triangle_ricochet <prefix> [-backend ricochet|mmap]
-//        [-policy default|degree] [-verts W] [-warmup Wu] [-measure M]
+//        [-policy default|degree] [-verts W] [-warmup Wu] [-voff V] [-measure M]
 //        [-threads T] [-phys MB]
 
 #include <algorithm>
@@ -199,6 +200,37 @@ static uint64_t run_window(bool ricochet, int policy, ricochet::RicochetRegion *
     return tri;
 }
 
+// KVM warmup (no UINTR): plain-read the adjacency of source vertices [s, e) and
+// touch each neighbour's adjacency, faulting the working set (hub pages) in from
+// the backing file.  Cheap in KVM; establishes residency before the checkpoint.
+static void kvm_warm_pass(const uint32_t *adj, const uint32_t *offsets,
+                          uint64_t n, uint64_t m, uint64_t s, uint64_t e, int T) {
+    uint64_t sink = 0;
+    #pragma omp parallel for num_threads(T) schedule(dynamic, 64) reduction(+:sink)
+    for (uint64_t u = s; u < e; u++) {
+        uint32_t us = offsets[u];
+        uint32_t ue = (u + 1 < n) ? offsets[u + 1] : (uint32_t)m;
+        for (uint32_t k = us; k < ue; k++) {
+            uint32_t v = adj[k];                       // read source adjacency
+            sink += adj[offsets[v]];                   // touch neighbour's page
+        }
+    }
+    if (sink == ~0ULL) fprintf(stderr, "");            // keep the reads live
+}
+
+// MADV_POPULATE_READ every contiguous run of pinned pages so the degree policy's
+// pinned set is resident before measurement (rest of the region stays cold).
+static void populate_pinned(void *base) {
+    uint64_t p = 0;
+    while (p < g_pin_pages) {
+        if (!is_pinned(p)) { p++; continue; }
+        uint64_t q = p;
+        while (q < g_pin_pages && is_pinned(q)) q++;
+        madvise((char *)base + p * 4096, (size_t)(q - p) * 4096, MADV_POPULATE_READ);
+        p = q;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         fprintf(stderr,
@@ -215,9 +247,11 @@ int main(int argc, char **argv) {
     int    backend       = BK_RICOCHET;
     int    policy        = POL_DEFAULT;
     uint64_t verts       = 2048;   // source vertices in the timed window
+    uint64_t voff        = ~0ULL;  // window start; default (sentinel) = n/2, past the hubs
 
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "-warmup")  && i + 1 < argc) warmup_verts  = (uint64_t)atoll(argv[++i]);
+        else if (!strcmp(argv[i], "-voff")    && i + 1 < argc) voff          = (uint64_t)atoll(argv[++i]);
         else if (!strcmp(argv[i], "-measure") && i + 1 < argc) measure_iters = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-threads") && i + 1 < argc) nthreads      = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-phys")    && i + 1 < argc) phys_mb       = (size_t)atoll(argv[++i]);
@@ -302,11 +336,21 @@ int main(int argc, char **argv) {
         adj = (const uint32_t *)a;
     }
 
-    // --- Policy setup + cold start, BEFORE the checkpoint (in KVM) ---
-    // The pin set + app-managed residency must be in place before the timed run,
-    // and the region must start cold so the O3 warmup window is what fills it via
-    // UPF (the previous split — warm in KVM, then cold_evict after checkpoint —
-    // left the measured window paying every fill fault).
+    bool ric = (backend == BK_RICOCHET);
+
+    // Window layout: warm [warm_beg, warm_end) then time [meas_beg, meas_end).
+    // Default start is n/2 — deep in the low-degree tail — so neither warmup nor
+    // the timed window processes a mega-hub *as a source* (that alone would make
+    // one source scan most of the graph).  Hub adjacencies are still read heavily
+    // as *neighbours*, so the reuse the degree policy exploits is preserved.
+    if (voff == ~0ULL) voff = n / 2;
+    if (voff > n) voff = 0;
+    uint64_t warm_beg = voff;
+    uint64_t warm_end = warm_beg + warmup_verts; if (warm_end > n) warm_end = n;
+    uint64_t meas_beg = warm_end;                if (meas_beg > n) meas_beg = n;
+    uint64_t meas_end = meas_beg + verts;        if (meas_end > n) meas_end = n;
+
+    // --- Policy setup (KVM, before the checkpoint) ---
     if (policy == POL_DEGREE) {
         // Pin the adjacency pages of the highest-degree vertices up to the cache
         // budget (leave nthreads*RING pages of streaming headroom for the FIFOs).
@@ -346,34 +390,29 @@ int main(int argc, char **argv) {
                pinned, total_pages);
     }
 
-    // Cold start: drop residency so the O3 warmup window fills the cache.
-    if (backend == BK_RICOCHET) {
+    // --- Warmup (KVM, before the checkpoint) ---
+    // Establish the residency the timed window will start from, cheaply in KVM.
+    // degree : pinned pages resident (populated), everything else cold so the
+    //          streaming (non-pinned) reads fault via UPF in O3 = the overhead
+    //          we measure.  default/mmap : fault the warmup window's working set
+    //          (source + hub-neighbour pages) in from the backing file.
+    if (policy == POL_DEGREE) {
         cold_evict_region(&adj_region);
-        ricochet::stop_handler_pool();
+        populate_pinned(adj_region.addr);
     } else {
-        madvise((void *)adj, adj_size, MADV_DONTNEED);
+        kvm_warm_pass(adj, offsets, n, m, warm_beg, warm_end, nthreads);
     }
+    if (ric) ricochet::stop_handler_pool();
 
-    // Window layout: warm [0, warm_end), then time [meas_beg, meas_end).
-    uint64_t warm_end = warmup_verts < n ? warmup_verts : n;
-    uint64_t meas_beg = warm_end;
-    uint64_t meas_end = meas_beg + verts;
-    if (meas_end > n) meas_end = n;
-    printf("[triangle] warmup [0,%" PRIu64 ")  measure [%" PRIu64 ",%" PRIu64 ")\n",
-           warm_end, meas_beg, meas_end);
-    fflush(stdout);
-
+    printf("[triangle] warmup [%" PRIu64 ",%" PRIu64 ")  measure [%" PRIu64 ",%" PRIu64 ")\n",
+           warm_beg, warm_end, meas_beg, meas_end);
     printf("[triangle] taking checkpoint\n");
     fflush(stdout);
     m5op_addr = 0xFFFF0000;
     map_m5_mem();
     m5_checkpoint_addr(0, 0);
 
-    // --- O3: single run — warmup window (untimed), then timed measured window(s) ---
-    bool ric = (backend == BK_RICOCHET);
-    run_window(ric, policy, &adj_region, adj, offsets, n, m,
-               0, warm_end, nthreads, /*verbose=*/false);
-
+    // --- O3: timed measured window(s) only ---
     // Edges in the measured window (CSR — no adj read); the throughput basis.
     uint64_t win_edges = 0;
     if (meas_beg < n && meas_end > meas_beg) {
