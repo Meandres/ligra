@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -442,6 +443,20 @@ int main(int argc, char **argv) {
         win_edges = e_end - e_beg;
     }
 
+    // Accumulate the measured lines so we can hand them to the host via
+    // m5 writefile (result_benchmark.txt) for the bench_runner to parse — the
+    // same mechanism db_bench uses.
+    std::string result_log;
+    {
+        char hdr[256];
+        snprintf(hdr, sizeof hdr,
+                 "[triangle] backend=%s policy=%s verts=%" PRIu64 " edges=%" PRIu64
+                 " cache=%zu MB threads=%d\n",
+                 ric ? "ricochet" : "mmap", policy == POL_DEGREE ? "degree" : "default",
+                 verts, win_edges, phys_mb, nthreads);
+        result_log += hdr;
+    }
+
     for (int it = 0; it < measure_iters; it++) {
         uint64_t faults_before = ric ? ricochet::global_cache().upfFaultCount.load() : 0;
         uint64_t c0 = rdtsc();
@@ -451,11 +466,21 @@ int main(int argc, char **argv) {
         uint64_t faults = ric ? ricochet::global_cache().upfFaultCount.load() - faults_before : 0;
         uint64_t cyc = c1 - c0;
         double eppk = cyc ? (double)win_edges / (double)cyc * 1000.0 : 0.0;
-        printf("[triangle] measure %d  triangles=%" PRIu64 "  edges=%" PRIu64
-               "  faults=%" PRIu64 "  cycles=%" PRIu64 "  edges_per_kcycle=%.3f\n",
-               it, tri, win_edges, faults, cyc, eppk);
+        char line[256];
+        snprintf(line, sizeof line,
+                 "[triangle] measure %d  triangles=%" PRIu64 "  edges=%" PRIu64
+                 "  faults=%" PRIu64 "  cycles=%" PRIu64 "  edges_per_kcycle=%.3f\n",
+                 it, tri, win_edges, faults, cyc, eppk);
+        fputs(line, stdout);
         fflush(stdout);
+        result_log += line;
     }
+
+    // Hand results to the host and end the simulation (no-op cleanup follows in
+    // case m5_exit is inert in some build).
+    m5_write_file_addr((void *)result_log.c_str(), (uint64_t)result_log.size(),
+                       0, "result_benchmark.txt");
+    m5_exit_addr(0);
 
     if (backend == BK_RICOCHET)
         ricochet::region_destroy(&adj_region);
