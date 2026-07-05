@@ -54,6 +54,26 @@ static uint64_t hb_step() {
     return s ? s : 1;
 }
 
+// Split resident memory into anonymous (temp scratch: p_curr/p_next/offsets,
+// stacks, OMP/libc) vs file-backed (the mmap'd adj cache).  RssAnon is what a
+// cgroup limit must accommodate ON TOP of the intended adj cache budget so the
+// mmap backend isn't starved of adj cache by its own scratch arrays.
+static void report_rss(const char *tag) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    long vmrss = 0, anon = 0, file = 0;
+    while (fgets(line, sizeof line, f)) {
+        sscanf(line, "VmRSS: %ld kB", &vmrss);
+        sscanf(line, "RssAnon: %ld kB", &anon);
+        sscanf(line, "RssFile: %ld kB", &file);
+    }
+    fclose(f);
+    printf("[mem] %s  VmRSS=%ld MB  RssAnon(temp)=%ld MB  RssFile(adj)=%ld MB\n",
+           tag, vmrss / 1024, anon / 1024, file / 1024);
+    fflush(stdout);
+}
+
 // Backend under test: our ricochet userspace page cache, or a plain kernel
 // mmap of the .adj file (the baseline we want to beat).  Same binary, chosen
 // at runtime with -backend, so both paths share the identical PageRank kernel.
@@ -303,6 +323,7 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < n; i++) p_next[i] = 0.0;
     }
 
+    report_rss("pre-checkpoint");
     printf("[pagerank] taking checkpoint\n");
     fflush(stdout);
     m5op_addr = 0xFFFF0000;

@@ -126,6 +126,26 @@ static inline uint64_t rdtsc() {
     return ((uint64_t)hi << 32) | lo;
 }
 
+// Split resident memory into anonymous (temp scratch: offsets, stacks, sort
+// vector, OMP/libc) vs file-backed (the mmap'd adj cache).  RssAnon is what a
+// cgroup limit must accommodate ON TOP of the intended adj cache budget so the
+// mmap backend isn't starved of adj cache by its own scratch data.
+static void report_rss(const char *tag) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    long vmrss = 0, anon = 0, file = 0;
+    while (fgets(line, sizeof line, f)) {
+        sscanf(line, "VmRSS: %ld kB", &vmrss);
+        sscanf(line, "RssAnon: %ld kB", &anon);
+        sscanf(line, "RssFile: %ld kB", &file);
+    }
+    fclose(f);
+    printf("[mem] %s  VmRSS=%ld MB  RssAnon(temp)=%ld MB  RssFile(adj)=%ld MB\n",
+           tag, vmrss / 1024, anon / 1024, file / 1024);
+    fflush(stdout);
+}
+
 // Count common neighbors w > v of two sorted adjacency lists (triangle u<v<w).
 static inline uint64_t intersect_gt(const uint32_t *au, uint32_t du,
                                     const uint32_t *av, uint32_t dv, uint32_t v) {
@@ -406,6 +426,7 @@ int main(int argc, char **argv) {
 
     printf("[triangle] warmup [%" PRIu64 ",%" PRIu64 ")  measure [%" PRIu64 ",%" PRIu64 ")\n",
            warm_beg, warm_end, meas_beg, meas_end);
+    report_rss("pre-checkpoint");
     printf("[triangle] taking checkpoint\n");
     fflush(stdout);
     m5op_addr = 0xFFFF0000;
