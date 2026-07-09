@@ -54,15 +54,21 @@ enum Backend { BK_RICOCHET, BK_MMAP };
 enum Policy  { POL_DEFAULT, POL_DEGREE };
 
 static const int   MAXT = 256;
-static const int   RING = 512;   // per-thread FIFO slots for non-pinned pages
+
+// Per-thread FIFO slots for non-pinned (streaming) pages.  Sized at policy
+// setup so the streaming reserve scales with the residency budget instead of
+// being a fixed constant (see the adaptive split in the policy setup below):
+// at a large cache the adaptive FIFO — not the static pin — must own most of
+// the budget, or the degree policy over-pins and loses to the oblivious default.
+static uint64_t g_ring = 512;
 
 // Degree-aware pin set (read-only during the measured phase): a bitmap over the
 // region's pages; a set bit means "high-degree, keep resident".
 static const uint8_t *g_pin_bitmap = nullptr;
 static uint64_t       g_pin_pages  = 0;
 
-// Per-thread FIFO of the last RING non-pinned pages; older ones are evicted.
-static thread_local uint64_t tl_ring[RING];
+// Per-thread FIFO of the last g_ring non-pinned pages; older ones are evicted.
+static thread_local uint64_t *tl_ring      = nullptr;
 static thread_local int      tl_ring_pos  = 0;
 static thread_local bool     tl_ring_init = false;
 static thread_local size_t   tl_evict_buf[64];
@@ -78,7 +84,8 @@ static void degree_on_fault(ricochet::RicochetRegion *r, size_t offset, void *) 
     uint64_t pg = offset >> 12;
     if (is_pinned(pg)) return;                     // degree-hot: keep resident
     if (!tl_ring_init) {
-        for (int i = 0; i < RING; i++) tl_ring[i] = ~0ULL;
+        tl_ring = (uint64_t *)malloc(g_ring * sizeof(uint64_t));
+        for (uint64_t i = 0; i < g_ring; i++) tl_ring[i] = ~0ULL;
         tl_ring_init = true;
     }
     uint64_t old = tl_ring[tl_ring_pos];
@@ -90,7 +97,7 @@ static void degree_on_fault(ricochet::RicochetRegion *r, size_t offset, void *) 
         }
     }
     tl_ring[tl_ring_pos] = pg;
-    tl_ring_pos = (tl_ring_pos + 1) % RING;
+    tl_ring_pos = (tl_ring_pos + 1) % (int)g_ring;
 }
 
 static void degree_flush(ricochet::RicochetRegion *r) {
@@ -386,7 +393,7 @@ int main(int argc, char **argv) {
         // counting a vertex's list is scanned ~degree(v) times, so the reuse of a
         // *page* is the sum of degree(v) over every vertex whose list touches it.
         // We rank pages by that weight and pin the heaviest up to the cache budget
-        // (leaving nthreads*RING pages of streaming headroom for the FIFOs).
+        // (leaving a residency-proportional streaming reserve for the FIFOs).
         //
         // This is a single linear pass over offsets[] (the CSR degree metadata),
         // not a traversal of the adjacency edges: it never reads the region.  The
@@ -412,7 +419,25 @@ int main(int argc, char **argv) {
         std::sort(order.begin(), order.end(),
                   [&](uint32_t a, uint32_t b) { return weight[a] > weight[b]; });
 
-        uint64_t stream = (uint64_t)nthreads * RING;
+        // Adaptive pin/stream split.  The streaming FIFO reserve grows with the
+        // residency budget (a fixed reserve made the static pin dominate at a
+        // large cache, where the oblivious default — an adaptive cache over the
+        // whole budget — captures the reused streaming set the pin cannot).  We
+        // give the FIFO a fraction of the budget that rises with residency, so
+        // the pinned set shrinks and the degree policy converges to the default
+        // as the cache grows, while a small cache still pins the hot pages.
+        //   frac(phys) rises with residency: at ~3% the pin still owns most of
+        //   the budget (degree wins); by ~10% the adaptive FIFO owns the majority
+        //   so degree tracks the oblivious default.  Slope is tunable.
+        double   occ        = total_pages ? (double)phys_pages / total_pages : 0.0;
+        double   stream_fr  = 0.25 + 3.5 * occ;            // 3% -> .35, 10% -> .60
+        if (stream_fr > 0.75) stream_fr = 0.75;
+        uint64_t stream     = (uint64_t)(phys_pages * stream_fr);
+        uint64_t min_stream = (uint64_t)nthreads * 64;     // floor so FIFOs work
+        if (stream < min_stream) stream = min_stream;
+        if (stream > phys_pages) stream = phys_pages / 2;
+        g_ring = stream / (uint64_t)nthreads;
+        if (g_ring < 64) g_ring = 64;
         uint64_t budget = phys_pages > stream ? phys_pages - stream : phys_pages / 2;
         if (budget > total_pages) budget = total_pages;
 
@@ -429,8 +454,9 @@ int main(int argc, char **argv) {
         g_pin_pages  = total_pages;
         adj_region.handlers.on_fault = degree_on_fault;
         ricochet::region_set_app_managed(&adj_region, true);
-        printf("[triangle] policy=degree: pinned %" PRIu64 " / %" PRIu64 " pages\n",
-               pinned, total_pages);
+        printf("[triangle] policy=degree: pinned %" PRIu64 " / %" PRIu64 " pages"
+               " (stream reserve %" PRIu64 " pages, ring %" PRIu64 "/thread)\n",
+               pinned, total_pages, stream, g_ring);
     }
 
     // --- Warmup (KVM, before the checkpoint) ---
