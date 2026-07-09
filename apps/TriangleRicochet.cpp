@@ -18,10 +18,14 @@
 //             small per-thread FIFO.  ricochet only fills; the app evicts.
 //
 // Warmup runs in KVM (fast) to establish residency, then the checkpoint switches
-// to O3 and only a small window of W source vertices is timed with rdtsc.  The
-// windows start at -voff (default n/2) so no source vertex is a mega-hub — in
-// RMAT a low-ID vertex has huge degree and processing it as a source scans most
-// of the graph.  Throughput is reported as edges/kcycle (degree-skew-normalised).
+// to O3 and the timed phase SWEEPS M consecutive ranges of W source vertices each
+// (-measure M -verts W), timing every range separately.  The sweep moves forward
+// from the warmed region so the reused high-degree neighbour pages stay hot under a
+// large cache but get evicted/re-fetched under a small one — that is how cache size
+// and the replacement policy show up in per-range throughput.  Windows start at
+// -voff (default n/2) so no source vertex is a mega-hub — in RMAT a low-ID vertex
+// has huge degree and processing it as a source scans most of the graph.
+// Throughput is reported per range as edges/kcycle (degree-skew-normalised).
 //
 // Usage: triangle_ricochet <prefix> [-backend ricochet|mmap]
 //        [-policy default|degree] [-verts W] [-warmup Wu] [-voff V] [-measure M]
@@ -202,7 +206,10 @@ static uint64_t run_window(bool ricochet, int policy, ricochet::RicochetRegion *
         int tid = omp_get_thread_num();
         if (ricochet) {
             ricochet::region_register_thread();
-            if (policy == POL_DEGREE) { tl_ring_init = false; tl_ring_pos = 0; tl_evict_n = 0; }
+            // Degree FIFO persists across the sweep's ranges (self-inits on the
+            // first fault): resetting it per range would make each range forget —
+            // and thus stop evicting — the pages it tracked, so residency would
+            // grow past the cache budget instead of streaming.
             #pragma omp barrier
             ricochet::region_enable_uintr();
         }
@@ -262,7 +269,7 @@ int main(int argc, char **argv) {
     }
     const char *prefix = argv[1];
     uint64_t warmup_verts  = 4096;   // source vertices warmed (untimed) to fill residency
-    int    measure_iters = 1;        // timed windows (variance samples)
+    int    measure_iters = 1;        // consecutive source ranges swept & timed (see the loop)
     int    nthreads      = omp_get_max_threads();
     size_t phys_mb       = 0;
     int    backend       = BK_RICOCHET;
@@ -367,41 +374,56 @@ int main(int argc, char **argv) {
     if (voff == ~0ULL) voff = n / 2;
     if (voff > n) voff = 0;
     uint64_t warm_beg = voff;
-    uint64_t warm_end = warm_beg + warmup_verts; if (warm_end > n) warm_end = n;
-    uint64_t meas_beg = warm_end;                if (meas_beg > n) meas_beg = n;
-    uint64_t meas_end = meas_beg + verts;        if (meas_end > n) meas_end = n;
+    uint64_t warm_end = warm_beg + warmup_verts;                 if (warm_end > n) warm_end = n;
+    uint64_t meas_beg = warm_end;                                if (meas_beg > n) meas_beg = n;
+    uint64_t meas_end = meas_beg + (uint64_t)measure_iters * verts;  // end of the whole sweep
+    if (meas_end > n) meas_end = n;
 
     // --- Policy setup (KVM, before the checkpoint) ---
     if (policy == POL_DEGREE) {
-        // Pin the adjacency pages of the highest-degree vertices up to the cache
-        // budget (leave nthreads*RING pages of streaming headroom for the FIFOs).
-        std::vector<uint32_t> order(n);
-        for (uint64_t i = 0; i < n; i++) order[i] = (uint32_t)i;
-        auto deg = [&](uint32_t v) {
-            uint32_t e = (v + 1 < n) ? offsets[v + 1] : (uint32_t)m;
-            return e - offsets[v];
-        };
-        std::sort(order.begin(), order.end(),
-                  [&](uint32_t a, uint32_t b) { return deg(a) > deg(b); });
-
+        // Pin pages by access weight, not by vertex degree.  A page holds many
+        // small adjacency lists (or part of one large list), and in triangle
+        // counting a vertex's list is scanned ~degree(v) times, so the reuse of a
+        // *page* is the sum of degree(v) over every vertex whose list touches it.
+        // We rank pages by that weight and pin the heaviest up to the cache budget
+        // (leaving nthreads*RING pages of streaming headroom for the FIFOs).
+        //
+        // This is a single linear pass over offsets[] (the CSR degree metadata),
+        // not a traversal of the adjacency edges: it never reads the region.  The
+        // pass must complete before ranking because top-budget selection is global.
         uint64_t total_pages = (adj_size + 4095) / 4096;
+
+        // Each vertex adds its full degree to every page its list spans, since
+        // each scan of the list reads all of those pages.
+        std::vector<uint64_t> weight(total_pages, 0);
+        for (uint64_t v = 0; v < n; v++) {
+            uint32_t e   = (v + 1 < n) ? offsets[v + 1] : (uint32_t)m;
+            uint32_t deg = e - offsets[v];
+            if (deg == 0) continue;
+            uint64_t b0 = (uint64_t)offsets[v] * sizeof(uint32_t);
+            uint64_t b1 = (uint64_t)e * sizeof(uint32_t);
+            for (uint64_t p = b0 >> 12; p <= (b1 - 1) >> 12; p++)
+                weight[p] += deg;
+        }
+
+        // Rank pages by descending weight.
+        std::vector<uint32_t> order(total_pages);
+        for (uint64_t p = 0; p < total_pages; p++) order[p] = (uint32_t)p;
+        std::sort(order.begin(), order.end(),
+                  [&](uint32_t a, uint32_t b) { return weight[a] > weight[b]; });
+
         uint64_t stream = (uint64_t)nthreads * RING;
         uint64_t budget = phys_pages > stream ? phys_pages - stream : phys_pages / 2;
         if (budget > total_pages) budget = total_pages;
 
+        // Pin the top-budget pages that carry any reuse.
         uint8_t *bitmap = (uint8_t *)calloc((total_pages + 7) / 8, 1);
         uint64_t pinned = 0;
-        for (uint32_t v : order) {
-            if (pinned >= budget) break;
-            uint64_t b0 = (uint64_t)offsets[v] * sizeof(uint32_t);
-            uint64_t b1 = (uint64_t)((v + 1 < n) ? offsets[v + 1] : (uint32_t)m)
-                          * sizeof(uint32_t);
-            if (b1 <= b0) continue;
-            for (uint64_t p = b0 >> 12; p <= (b1 - 1) >> 12 && pinned < budget; p++)
-                if (!((bitmap[p >> 3] >> (p & 7)) & 1u)) {
-                    bitmap[p >> 3] |= (uint8_t)(1u << (p & 7));
-                    pinned++;
-                }
+        for (uint64_t i = 0; i < total_pages && pinned < budget; i++) {
+            uint32_t p = order[i];
+            if (weight[p] == 0) break;
+            bitmap[p >> 3] |= (uint8_t)(1u << (p & 7));
+            pinned++;
         }
         g_pin_bitmap = bitmap;
         g_pin_pages  = total_pages;
@@ -423,7 +445,12 @@ int main(int argc, char **argv) {
     } else {
         kvm_warm_pass(adj, offsets, n, m, warm_beg, warm_end, nthreads);
     }
-    if (ric) ricochet::stop_handler_pool();
+    // The handler pool is deliberately kept alive through the measured phase.
+    // A fault that traps to the kernel on a UPF-stamped page (instead of being
+    // hardware-delivered) queues on the region's uffd; with the pool stopped
+    // that thread sleeps forever -- the intermittent whole-run hang we observed.
+    // With the pool alive, such a misroute costs one slow (uffd-path) fault and
+    // shows up in the uffd= counter of the measure lines.
 
     printf("[triangle] warmup [%" PRIu64 ",%" PRIu64 ")  measure [%" PRIu64 ",%" PRIu64 ")\n",
            warm_beg, warm_end, meas_beg, meas_end);
@@ -434,14 +461,17 @@ int main(int argc, char **argv) {
     map_m5_mem();
     m5_checkpoint_addr(0, 0);
 
-    // --- O3: timed measured window(s) only ---
-    // Edges in the measured window (CSR — no adj read); the throughput basis.
-    uint64_t win_edges = 0;
-    if (meas_beg < n && meas_end > meas_beg) {
-        uint64_t e_beg = offsets[meas_beg];
-        uint64_t e_end = (meas_end < n) ? offsets[meas_end] : m;
-        win_edges = e_end - e_beg;
-    }
+    // --- O3: timed measured phase — a forward SWEEP of consecutive source ranges.
+    // Each of the `measure_iters` ranges is `verts` source vertices, timed on its
+    // own.  Warmup made the range just before meas_beg resident, so the sweep starts
+    // warm and moves forward: the shared high-degree *neighbour* pages are reused
+    // across ranges, so a large cache keeps them resident (throughput stays high)
+    // while a small cache evicts and re-fetches them (per-range faults rise and
+    // throughput drops) — that's the cache-size / replacement-policy sensitivity we
+    // want to expose (re-running one resident window, as before, showed none).
+    if (verts == 0) measure_iters = 0;
+    else if (meas_beg + (uint64_t)measure_iters * verts > n)
+        measure_iters = (int)((n > meas_beg ? n - meas_beg : 0) / verts);
 
     // Accumulate the measured lines so we can hand them to the host via
     // m5 writefile (result_benchmark.txt) for the bench_runner to parse — the
@@ -450,27 +480,36 @@ int main(int argc, char **argv) {
     {
         char hdr[256];
         snprintf(hdr, sizeof hdr,
-                 "[triangle] backend=%s policy=%s verts=%" PRIu64 " edges=%" PRIu64
+                 "[triangle] backend=%s policy=%s ranges=%d range_verts=%" PRIu64
                  " cache=%zu MB threads=%d\n",
                  ric ? "ricochet" : "mmap", policy == POL_DEGREE ? "degree" : "default",
-                 verts, win_edges, phys_mb, nthreads);
+                 measure_iters, verts, phys_mb, nthreads);
         result_log += hdr;
     }
 
     for (int it = 0; it < measure_iters; it++) {
+        uint64_t rbeg = meas_beg + (uint64_t)it * verts;
+        uint64_t rend = rbeg + verts; if (rend > n) rend = n;
+        uint64_t e_beg = offsets[rbeg];
+        uint64_t e_end = (rend < n) ? offsets[rend] : m;
+        uint64_t win_edges = e_end - e_beg;   // edges in THIS range (throughput basis)
+
         uint64_t faults_before = ric ? ricochet::global_cache().upfFaultCount.load() : 0;
+        uint64_t uffd_before   = ric ? ricochet::uffd_handled_count() : 0;
         uint64_t c0 = rdtsc();
         uint64_t tri = run_window(ric, policy, &adj_region, adj, offsets, n, m,
-                                  meas_beg, meas_end, nthreads, /*verbose=*/true);
+                                  rbeg, rend, nthreads, /*verbose=*/true);
         uint64_t c1 = rdtsc();
         uint64_t faults = ric ? ricochet::global_cache().upfFaultCount.load() - faults_before : 0;
+        uint64_t uffd   = ric ? ricochet::uffd_handled_count() - uffd_before : 0;
         uint64_t cyc = c1 - c0;
         double eppk = cyc ? (double)win_edges / (double)cyc * 1000.0 : 0.0;
         char line[256];
         snprintf(line, sizeof line,
                  "[triangle] measure %d  triangles=%" PRIu64 "  edges=%" PRIu64
-                 "  faults=%" PRIu64 "  cycles=%" PRIu64 "  edges_per_kcycle=%.3f\n",
-                 it, tri, win_edges, faults, cyc, eppk);
+                 "  faults=%" PRIu64 "  cycles=%" PRIu64 "  edges_per_kcycle=%.3f"
+                 "  uffd=%" PRIu64 "\n",
+                 it, tri, win_edges, faults, cyc, eppk, uffd);
         fputs(line, stdout);
         fflush(stdout);
         result_log += line;
