@@ -365,6 +365,10 @@ int main(int argc, char **argv) {
         void *a = mmap(nullptr, adj_size, PROT_READ, MAP_PRIVATE, adj_fd, 0);
         if (a == MAP_FAILED) { perror("mmap adj"); return 1; }
         madvise(a, adj_size, MADV_NOHUGEPAGE);
+        // Disable readahead so every backend fetches one page per fault;
+        // otherwise mmap's cluster reads amortize the device round trip in a
+        // way no userspace fault path is allowed to.
+        madvise(a, adj_size, MADV_RANDOM);
         adj = (const uint32_t *)a;
     }
 
