@@ -55,11 +55,8 @@ enum Policy  { POL_DEFAULT, POL_DEGREE };
 
 static const int   MAXT = 256;
 
-// Per-thread FIFO slots for non-pinned (streaming) pages.  Sized at policy
-// setup so the streaming reserve scales with the residency budget instead of
-// being a fixed constant (see the adaptive split in the policy setup below):
-// at a large cache the adaptive FIFO — not the static pin — must own most of
-// the budget, or the degree policy over-pins and loses to the oblivious default.
+// Per-thread FIFO slots for non-pinned (streaming) pages: a small fixed
+// reserve so nearly the whole budget goes to the static pin set.
 static uint64_t g_ring = 512;
 
 // Degree-aware pin set (read-only during the measured phase): a bitmap over the
@@ -419,23 +416,10 @@ int main(int argc, char **argv) {
         std::sort(order.begin(), order.end(),
                   [&](uint32_t a, uint32_t b) { return weight[a] > weight[b]; });
 
-        // Adaptive pin/stream split.  The streaming FIFO reserve grows with the
-        // residency budget (a fixed reserve made the static pin dominate at a
-        // large cache, where the oblivious default — an adaptive cache over the
-        // whole budget — captures the reused streaming set the pin cannot).  We
-        // give the FIFO a fraction of the budget that rises with residency, so
-        // the pinned set shrinks and the degree policy converges to the default
-        // as the cache grows, while a small cache still pins the hot pages.
-        //   frac(phys) rises with residency: at ~3% the pin still owns most of
-        //   the budget (degree wins); by ~10% the adaptive FIFO owns the majority
-        //   so degree tracks the oblivious default.  Slope is tunable.
-        double   occ        = total_pages ? (double)phys_pages / total_pages : 0.0;
-        double   stream_fr  = 0.25 + 3.5 * occ;            // 3% -> .35, 10% -> .60
-        if (stream_fr > 0.75) stream_fr = 0.75;
-        uint64_t stream     = (uint64_t)(phys_pages * stream_fr);
-        uint64_t min_stream = (uint64_t)nthreads * 64;     // floor so FIFOs work
-        if (stream < min_stream) stream = min_stream;
-        if (stream > phys_pages) stream = phys_pages / 2;
+        // Static pin/stream split: a small fixed streaming reserve for the
+        // per-thread FIFOs; every remaining budget page is pinned by weight.
+        uint64_t stream = (uint64_t)nthreads * 64;
+        if (stream > phys_pages / 2) stream = phys_pages / 2;
         g_ring = stream / (uint64_t)nthreads;
         if (g_ring < 64) g_ring = 64;
         uint64_t budget = phys_pages > stream ? phys_pages - stream : phys_pages / 2;
