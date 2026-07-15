@@ -420,12 +420,11 @@ int main(int argc, char **argv) {
         std::sort(order.begin(), order.end(),
                   [&](uint32_t a, uint32_t b) { return weight[a] > weight[b]; });
 
-        // Static pin/stream split: a small fixed streaming reserve for the
-        // per-thread FIFOs; every remaining budget page is pinned by weight.
-        uint64_t stream = (uint64_t)nthreads * 64;
-        if (stream > phys_pages / 2) stream = phys_pages / 2;
-        g_ring = stream / (uint64_t)nthreads;
-        if (g_ring < 64) g_ring = 64;
+        // Static pin/stream split: a fixed 512-slot per-thread streaming FIFO;
+        // every remaining budget page is pinned by weight.  When the budget is
+        // smaller than the reserve, pin half of it and let the FIFOs stream.
+        g_ring = 512;
+        uint64_t stream = (uint64_t)nthreads * g_ring;
         uint64_t budget = phys_pages > stream ? phys_pages - stream : phys_pages / 2;
         if (budget > total_pages) budget = total_pages;
 
