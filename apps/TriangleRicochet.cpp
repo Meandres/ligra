@@ -18,11 +18,12 @@
 //             small per-thread FIFO.  ricochet only fills; the app evicts.
 //
 // Warmup runs in KVM (fast) to establish residency, then the checkpoint switches
-// to O3 and the timed phase SWEEPS M consecutive ranges of W source vertices each
-// (-measure M -verts W), timing every range separately.  The sweep moves forward
-// from the warmed region so the reused high-degree neighbour pages stay hot under a
-// large cache but get evicted/re-fetched under a small one — that is how cache size
-// and the replacement policy show up in per-range throughput.  Windows start at
+// to O3 and the timed phase runs the SAME window of W source vertices M times
+// (-measure M -verts W), timing every repetition separately.  Repeating a fixed
+// window measures steady-state throughput on a stable working set: its reused
+// high-degree neighbour pages stay hot under a large cache but get evicted and
+// re-fetched under a small one — that is how cache size and the replacement
+// policy show up in per-repetition throughput.  The window starts at
 // -voff (default n/2) so no source vertex is a mega-hub — in RMAT a low-ID vertex
 // has huge degree and processing it as a source scans most of the graph.
 // Throughput is reported per range as edges/kcycle (degree-skew-normalised).
@@ -501,7 +502,7 @@ int main(int argc, char **argv) {
     }
 
     for (int it = 0; it < measure_iters; it++) {
-        uint64_t rbeg = meas_beg + (uint64_t)it * verts;
+        uint64_t rbeg = meas_beg;
         uint64_t rend = rbeg + verts; if (rend > n) rend = n;
         uint64_t e_beg = offsets[rbeg];
         uint64_t e_end = (rend < n) ? offsets[rend] : m;
