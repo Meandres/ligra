@@ -459,6 +459,12 @@ int main(int argc, char **argv) {
     } else {
         kvm_warm_pass(adj, offsets, n, m, warm_beg, warm_end, nthreads);
     }
+    // Prefault worker stacks in KVM so the per-range register_thread mlock
+    // (inside the timed windows) becomes a no-op; libgomp reuses this pool.
+    if (ric) {
+        #pragma omp parallel num_threads(nthreads)
+        ricochet::region_prefault_thread_stack();
+    }
     // The handler pool is deliberately kept alive through the measured phase.
     // A fault that traps to the kernel on a UPF-stamped page (instead of being
     // hardware-delivered) queues on the region's uffd; with the pool stopped
